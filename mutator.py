@@ -8,6 +8,7 @@ import random
 import io
 import sys
 import os
+import copy
 
 import pikepdf
 from pikepdf import Name, Stream, Dictionary, Array
@@ -16,7 +17,9 @@ from pikepdf import Name, Stream, Dictionary, Array
 # Global state
 # -----------------------------
 _initialized = False
-_mutation_count = 1   # fuzz cycles per input
+_mutation_count = 100   # fuzz cycles per input
+
+HEADER_SIZE = 4 # How many bytes is our fuzzing header???
 
 # -----------------------------
 # Expanded type map
@@ -190,7 +193,8 @@ def mutate_pdf(buf: bytes) -> bytes:
             out = io.BytesIO()
             pdf.save(out, linearize=False, compress_streams=False)
             return out.getvalue()
-    except Exception:
+    except Exception as e:
+        # raise(e)
         return mutate_generic(buf)
 
 # -----------------------------
@@ -243,10 +247,11 @@ def fuzz_count(buf):
     return _mutation_count
 
 def fuzz(buf, add_buf, max_size):
+    orig_header = buf[:HEADER_SIZE] # Save header for now...
     mutated = mutate_pdf(buf)
     if len(mutated) > max_size:
         mutated = mutated[:max_size]
-    return mutated
+    return orig_header + mutated # Append header back
 
 TEST_MAX_SIZE = 1_000_000
 
@@ -264,9 +269,13 @@ def run_tests():
         fh = open(directory+fn, "rb")
         data = bytearray(fh.read())
         fh.close()
-        new_data = fuzz(data, None, TEST_MAX_SIZE)
+        data = bytearray(b"\x00\x00\x00\x00") + data # Add the fuzzing header for now...
+        for _ in range(_mutation_count):
+            data = copy.deepcopy(data)
+            data = fuzz(data, None, TEST_MAX_SIZE)
+        data = data[HEADER_SIZE:] # Cut out the header... This is because we want to actually observe the result in a web browser etc...
         fh = open(OUT_DIR+fn, "wb")
-        fh.write(bytes(new_data))
+        fh.write(bytes(data))
         fh.close()
     return
 
