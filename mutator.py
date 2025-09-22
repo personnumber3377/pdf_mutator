@@ -7,6 +7,7 @@ Implements AFL++ Python custom mutator interface: init, deinit, fuzz_count, fuzz
 import random
 import io
 import sys
+import os
 
 import pikepdf
 from pikepdf import Name, Stream, Dictionary, Array
@@ -15,7 +16,7 @@ from pikepdf import Name, Stream, Dictionary, Array
 # Global state
 # -----------------------------
 _initialized = False
-_mutation_count = 16   # fuzz cycles per input
+_mutation_count = 1   # fuzz cycles per input
 
 # -----------------------------
 # Expanded type map
