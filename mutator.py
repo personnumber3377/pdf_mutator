@@ -17,7 +17,7 @@ from pikepdf import Name, Stream, Dictionary, Array
 # Global state
 # -----------------------------
 _initialized = False
-_mutation_count = 100   # fuzz cycles per input
+_mutation_count = 1000   # fuzz cycles per input
 
 HEADER_SIZE = 4 # How many bytes is our fuzzing header???
 
@@ -251,7 +251,9 @@ def fuzz(buf, add_buf, max_size):
     mutated = mutate_pdf(buf)
     if len(mutated) > max_size:
         mutated = mutated[:max_size]
-    return orig_header + mutated # Append header back
+    return_data = orig_header + mutated
+    assert return_data[:HEADER_SIZE] == orig_header
+    return return_data # Append header back
 
 TEST_MAX_SIZE = 1_000_000
 
