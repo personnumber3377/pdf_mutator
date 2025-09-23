@@ -3,10 +3,12 @@
 mutator.py -- AFL++ Python custom mutator for PDF structural mutations.
 
 Features:
- - Deterministic mutation decisions derived from the input bytes (no global RNG seeding).
+ - Deterministic mutation decisions derived from the input bytes (no global RNG).
  - Loads a corpus of resource-like dictionaries from a PDF directory or a cached resources.pkl.
- - Mutation action: replace an entire object (Stream or Dictionary) from the input PDF
-   with a sampled resource-dictionary converted into pikepdf objects.
+ - Mutation actions:
+     * replace an entire object (Stream or Dictionary) with a sample from the resources DB
+     * or mutate an object in-place (dictionary / stream) using type-aware modifications
+     * or shuffle pages
  - Keeps a small header (HEADER_SIZE) unchanged.
  - Raises on conversion failures (no silent fallback to generic byte-level mutations).
  - Exposes AFL++ interface: init(seed), deinit(), fuzz_count(buf), fuzz(buf, add_buf, max_size).
@@ -26,6 +28,8 @@ from typing import Any, Dict, List, Tuple
 import random
 import traceback
 
+sys.setrecursionlimit(20000)
+
 try:
     import pikepdf
     from pikepdf import Name, Dictionary, Array, Stream
@@ -34,81 +38,131 @@ except Exception as e:
     raise
 
 # -----------------------------
-# Config
+# Config / Globals
 # -----------------------------
 HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
 DEFAULT_MUTATION_COUNT = 1000
+MAX_DB_SIZE = 1000
+MAX_CALL_COUNT = 200000
+BANNED_KEYS = set(["/Length"])  # Do not modify these on stream dicts
+MAX_RECURSION = 8
+
 DEFAULT_PDF_DIR = Path(os.environ.get("MUTATOR_PDF_DIR", "./pdf_seed_corpus/"))
 DEFAULT_PKL_PATH = Path(os.environ.get("MUTATOR_PKL_PATH", "./resources.pkl"))
 
 _mutation_count = DEFAULT_MUTATION_COUNT
 _initialized = False
-_resources_db: List[Dict[str, Any]] = []  # list of python-serializable resource dict samples
+_resources_db: List[Dict[str, Any]] = []  # python-serializable resource dict samples
+_call_counter = 0
+
+# -----------------------------
+# Type map (for guided dict edits)
+# -----------------------------
+DICT_TYPE_MAP = {
+    "LW": "number", "LC": "int", "LJ": "int", "ML": "number",
+    "D": "array", "RI": "name", "OP": "bool", "op": "bool",
+    "OPM": "int", "Font": "array", "BG": "any", "BG2": "any",
+    "UCR": "any", "UCR2": "any", "TR": "any", "TR2": "any",
+    "FL": "number", "SM": "number", "SA": "bool",
+    "BM": "name", "SMask": "dict", "CA": "number", "ca": "number",
+    "AIS": "bool", "TK": "bool",
+    "Frequency": "number", "Angle": "number", "SpotFunction": "any",
+    "AccurateScreens": "bool", "HalftoneType": "int",
+    "Width": "int", "Height": "int", "Width2": "int", "Height2": "int",
+    "Xsquare": "int", "Ysquare": "int",
+    "FontDescriptor": "dict", "BaseFont": "name", "DW": "number",
+    "DW2": "array", "W": "array", "W2": "array", "CIDToGIDMap": "any",
+    "CIDSystemInfo": "dict", "Registry": "string", "Ordering": "string",
+    "Supplement": "int", "Flags": "int", "FontBBox": "array",
+    "FontMatrix": "array", "Encoding": "any", "ToUnicode": "any",
+    "FontName": "name", "StemV": "int", "XHeight": "int", "CapHeight": "int",
+    "Ascent": "int", "Descent": "int", "AvgWidth": "int", "MaxWidth": "int",
+    "ItalicAngle": "number", "Leading": "int", "MissingWidth": "int",
+    "DecodeParms": "dict", "Filter": "name", "SMaskInData": "int",
+    "Interpolate": "bool", "ImageMask": "bool",
+    "MediaBox": "array", "CropBox": "array", "Rotate": "int",
+    "UserUnit": "number", "Resources": "dict", "Annots": "array",
+    "FunctionType": "int", "Order": "int", "BitsPerSample": "int",
+    "Functions": "array", "Size": "int", "Index": "array", "Prev": "int",
+    "Producer": "string", "Creator": "string", "Author": "string",
+    "Title": "string", "Subject": "string", "Keywords": "string",
+}
 
 # -----------------------------
 # Utilities: convert pikepdf objects -> python-serializable repr and back
 # -----------------------------
-def pike_to_py(obj):
+def pike_to_py(obj: Any, depth: int = 0) -> Dict[str, Any]:
     """
     Convert pikepdf object to a Python-serializable structure.
     Supported: Name, Dictionary, Array, Stream (represented as dict), numbers, bool, bytes/str.
     """
+    global _call_counter
+    _call_counter += 1
+    if _call_counter > MAX_CALL_COUNT:
+        raise RuntimeError("conversion call limit exceeded")
 
-    # Names -> string with leading '/'
     if isinstance(obj, Name):
         return {"__type__": "name", "value": str(obj)}  # e.g. "/F1"
-    # Stream -> dict with 'stream_bytes' and 'dict' (metadata)
+
     if isinstance(obj, Stream):
         d = {}
-        for k, v in obj.items():
-            try:
-                d[str(k)] = pike_to_py(v)
-            except Exception:
-                d[str(k)] = {"__type__": "unknown"}
+        try:
+            for k, v in obj.items():
+                # avoid deep recursion
+                if depth >= MAX_RECURSION:
+                    d[str(k)] = {"__type__": "unknown"}
+                else:
+                    d[str(k)] = pike_to_py(v, depth=depth+1)
+        except Exception:
+            pass
         # attempt to read bytes
         try:
             raw = obj.read_bytes() or b""
         except Exception:
             raw = b""
         return {"__type__": "stream", "dict": d, "stream_bytes": bytes(raw)}
-    # Dictionary -> map
+
     if isinstance(obj, Dictionary):
         out = {}
+        if depth >= MAX_RECURSION:
+            return {"__type__": "dict", "value": out}
         for k, v in obj.items():
             try:
-                out[str(k)] = pike_to_py(v)
+                out[str(k)] = pike_to_py(v, depth=depth+1)
             except Exception:
                 out[str(k)] = {"__type__": "unknown"}
         return {"__type__": "dict", "value": out}
-    # Array -> list
+
     if isinstance(obj, Array):
         lst = []
         for v in obj:
             try:
-                lst.append(pike_to_py(v))
+                lst.append(pike_to_py(v, depth=depth+1))
             except Exception:
                 lst.append({"__type__": "unknown"})
         return {"__type__": "array", "value": lst}
-    # primitives
-    if isinstance(obj, (int, float, bool)):
+
+    if isinstance(obj, (int, float, bool, decimal.Decimal)): # Also check for decimal stuff...
         return {"__type__": "primitive", "value": obj}
-    # bytes/str
+
     if isinstance(obj, bytes):
         return {"__type__": "bytes", "value": obj}
+
     if isinstance(obj, str):
         return {"__type__": "string", "value": obj}
-    # fallback
-    return {"__type__": "unknown", "repr": str(obj)}
+    assert False
+    # print("This here is unknown stuff: "+str(obj))
+    # print("type of the thing: "+str(type(obj)))
+    # return {"__type__": "unknown", "repr": str(obj)}
 
 
-def py_to_pike(pyobj, pdf=None):
+def py_to_pike(pyobj: Any, pdf: pikepdf.Pdf = None) -> Any:
     """
     Convert Python-serializable representation back to pikepdf objects.
-    Returns pikepdf object (Name/Dictionary/Array/Stream/primitive).
-    `pdf` is optional pikepdf.Pdf instance used as a factory for certain constructors.
+    Returns pikepdf object (Name/Dictionary/Array/Stream/primitive) or special marker for stream construction.
     """
     if not isinstance(pyobj, dict) or "__type__" not in pyobj:
-        # primitive raw value maybe
+        # allow raw primitives
         if isinstance(pyobj, (int, float, bool)):
             return pyobj
         if isinstance(pyobj, bytes):
@@ -119,14 +173,15 @@ def py_to_pike(pyobj, pdf=None):
 
     t = pyobj["__type__"]
 
-    if t == "name":
-        # value is string like "/F1" or "F1"
+    if t in ("name", "unknown"):
         v = pyobj.get("value", "")
-        if isinstance(v, str):
-            if not v.startswith("/"):
-                v = "/" + v
-            return Name(v)
-        raise ValueError("Invalid name representation")
+        if not isinstance(v, str):
+            v = str(v)
+        if not v.startswith("/"):
+            v = "/" + v
+        if len(v) == 1:
+            v = v + "A"
+        return Name(v)
 
     if t == "primitive":
         return pyobj.get("value")
@@ -138,9 +193,8 @@ def py_to_pike(pyobj, pdf=None):
         return pyobj.get("value", "")
 
     if t == "array":
-        lst = pyobj.get("value", [])
         out = Array()
-        for el in lst:
+        for el in pyobj.get("value", []):
             out.append(py_to_pike(el, pdf=pdf))
         return out
 
@@ -148,46 +202,32 @@ def py_to_pike(pyobj, pdf=None):
         d = pyobj.get("value", {})
         out = Dictionary()
         for k_str, v_py in d.items():
-            # keys are strings like "/Font" or "Font"
             if k_str.startswith("/"):
-                k = Name(k_str)
+                key_name = k_str
             else:
-                k = Name("/" + k_str)
-            try:
-                out[k] = py_to_pike(v_py, pdf=pdf)
-            except Exception as ex:
-                # fail fast (user asked raise on failures)
-                raise RuntimeError(f"Failed to convert dict value for key {k_str}: {ex}")
+                key_name = "/" + k_str
+            k = Name(key_name)
+            out[k] = py_to_pike(v_py, pdf=pdf)
         return out
 
     if t == "stream":
         metadata = pyobj.get("dict", {})
         stream_bytes = pyobj.get("stream_bytes", b"")
-        # convert metadata keys
         md = Dictionary()
         for k_str, v_py in metadata.items():
-            if k_str.startswith("/"):
-                k = Name(k_str)
-            else:
-                k = Name("/" + k_str)
-            md[k] = py_to_pike(v_py, pdf=pdf)
-        # construct a Stream using pikepdf.Stream(pdf, data, stream_dict)
-        # If pdf is None we create a temporary one (pike requires owner for Stream)
+            key_name = k_str if k_str.startswith("/") else "/" + k_str
+            md[Name(key_name)] = py_to_pike(v_py, pdf=pdf)
+        # pikepdf requires a Pdf owner to create Stream objects cleanly.
+        # If we can't create a pike Stream (pdf is None) we return a special marker for caller to construct.
         if pdf is None:
-            with pikepdf.Pdf.new() as tmp:
-                s = pikepdf.Stream(tmp, stream_bytes)
-                # attach metadata
-                for kk, vv in md.items():
-                    s[kk] = vv
-                # We return the stream but its owner lifetime is bounded; to avoid subtle issues
-                # better to return a Dictionary representing the metadata plus bytes; the caller
-                # can write a new stream on the target PDF. We'll return a tuple marker for the caller.
-                return {"__construct_stream__": {"dict": md, "bytes": stream_bytes}}
-        else:
-            s = pikepdf.Stream(pdf, stream_bytes)
-            for kk, vv in md.items():
-                s[kk] = vv
-            return s
+            return {"__construct_stream__": {"dict": md, "bytes": stream_bytes}}
+        s = pikepdf.Stream(pdf, stream_bytes)
+        for kk, vv in md.items():
+            kk_str = str(kk)
+            if kk_str in BANNED_KEYS:
+                continue
+            s[kk] = vv
+        return s
 
     raise ValueError("Unsupported py -> pike type: " + t)
 
@@ -198,25 +238,20 @@ def py_to_pike(pyobj, pdf=None):
 def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
     """
     Extract resource-like dictionaries from a single PDF file.
-    We gather `page.Resources` dictionaries and also dictionary-like objects found in pdf.objects
-    that look like resource containers (i.e., contain keys /Font, /XObject, /ColorSpace, /ProcSet, /ExtGState).
-    Returns a list of python-serializable resource dicts.
+    Returns list of Python-serializable samples.
     """
     samples = []
     try:
         with pikepdf.open(pdf_path) as pdf:
-            # scan pages' /Resources
+            # pages' /Resources
             for p in pdf.pages:
                 try:
                     r = p.get("/Resources")
-                    if r is None:
-                        continue
-                    py = pike_to_py(r)
-                    samples.append(py)
+                    if r:
+                        samples.append(pike_to_py(r))
                 except Exception:
-                    continue
-
-            # scan top-level objects to find resource-like dictionaries
+                    pass
+            # scan top-level objects for resource-like dicts
             for obj in pdf.objects:
                 try:
                     if isinstance(obj, pikepdf.Dictionary):
@@ -225,7 +260,6 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
                         if keys & indicator:
                             samples.append(pike_to_py(obj))
                     elif isinstance(obj, pikepdf.Stream):
-                        # check its stream dict for indicators
                         sd = obj.stream_dict if hasattr(obj, "stream_dict") else obj
                         if sd is None:
                             continue
@@ -233,9 +267,8 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
                         if dkeys & {"Font", "XObject", "ColorSpace", "ProcSet", "ExtGState"}:
                             samples.append(pike_to_py(sd))
                 except Exception:
-                    continue
+                    pass
     except Exception as e:
-        # propagate upwards; caller may want to skip but we design to be robust here
         print(f"Warning: failed to open {pdf_path}: {e}", file=sys.stderr)
     return samples
 
@@ -253,19 +286,17 @@ def build_resources_db_from_dir(pdf_dir: Path, pkl_path: Path) -> List[Dict[str,
             samples = extract_resource_samples_from_pdf(p)
             if samples:
                 db.extend(samples)
-            # keep DB size reasonable
-            if len(db) > 5000:
+            if len(db) >= MAX_DB_SIZE:
                 break
         except Exception:
-            continue
+            pass
 
-    # save pickle
     try:
         with open(pkl_path, "wb") as fh:
-            pickle.dump(db, fh)
+            pickle.dump(db[:MAX_DB_SIZE], fh)
     except Exception as e:
         print(f"Warning: could not write resources pkl {pkl_path}: {e}", file=sys.stderr)
-    return db
+    return db[:MAX_DB_SIZE]
 
 
 def load_resources_db(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
@@ -273,7 +304,6 @@ def load_resources_db(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
     if pkl_path.exists():
         try:
             pkl_mtime = pkl_path.stat().st_mtime
-            # if pdf_dir exists and any pdf is newer than pickle, rebuild
             rebuild = False
             if pdf_dir.exists() and pdf_dir.is_dir():
                 for p in pdf_dir.iterdir():
@@ -285,11 +315,9 @@ def load_resources_db(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
                     db = pickle.load(fh)
                     if isinstance(db, list):
                         return db
-        except Exception as e:
-            print(f"Warning: failed to load or validate {pkl_path}: {e}", file=sys.stderr)
-    # otherwise build from pdf_dir
-    db = build_resources_db_from_dir(pdf_dir, pkl_path)
-    return db
+        except Exception:
+            pass
+    return build_resources_db_from_dir(pdf_dir, pkl_path)
 
 
 # -----------------------------
@@ -298,22 +326,130 @@ def load_resources_db(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
 def rng_from_buf(buf: bytes) -> random.Random:
     """
     Create a deterministic RNG seeded from the input buffer bytes (excluding header).
-    We use a stable hash of an initial slice to seed the RNG.
+    Use a stable hash of a slice to seed the RNG.
     """
-    # use up to 64 bytes after header
-    raw = buf[HEADER_SIZE:HEADER_SIZE + 64]
+    raw = buf[HEADER_SIZE:HEADER_SIZE + 128]
     if not raw:
         raw = buf[:HEADER_SIZE] or b"\x00"
     h = hashlib.sha256(raw).digest()
     seed_int = int.from_bytes(h[:8], "little")
-    return random.Random(seed_int)
+    return random.Random(random.randrange(1,1000)) # random.Random(random.randrange(1000000)) # random.Random(seed_int)
 
 
 # -----------------------------
-# Mutation strategies (structural)
+# Mutation helpers (deterministic with provided rng)
 # -----------------------------
+def pick_choice(seq, rng: random.Random):
+    if not seq:
+        return None
+    return seq[rng.randrange(len(seq))]
+
+
+def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0):
+    """
+    Mutate a pikepdf.Dictionary in-place using type-aware operations.
+    Uses `rng` for all randomness.
+    """
+    if not isinstance(obj, Dictionary) or not obj.keys():
+        return False
+    keys = list(obj.keys())
+    key = pick_choice(keys, rng)
+    if key is None:
+        return False
+    expected = DICT_TYPE_MAP.get(str(key).lstrip("/"), "any")
+    try:
+        val = obj[key]
+        # int
+        if expected == "int" and isinstance(val, int):
+            obj[key] = val + rng.randint(-2000, 2000)
+        elif expected == "number" and isinstance(val, (int, float)):
+            # scale
+            factor = 1.0 + (rng.random() - 0.5) * 2.0
+            obj[key] = float(val) * factor
+        elif expected == "array" and isinstance(val, Array):
+            if len(val) > 0 and isinstance(val[0], int):
+                idx = rng.randrange(len(val))
+                val[idx] = val[idx] + rng.randint(-500, 500)
+            else:
+                # append small int
+                val.append(rng.randint(-1000, 1000))
+        elif expected == "name":
+            obj[key] = Name("/MUT" + str(rng.randint(0, 99999)))
+        elif expected == "bool":
+            obj[key] = not bool(val)
+        elif expected == "string":
+            s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, 12)))
+            obj[key] = s
+        elif expected == "dict" and isinstance(val, Dictionary) and depth < MAX_RECURSION:
+            mutate_dict_inplace(val, rng, depth+1)
+        elif expected == "stream" and isinstance(val, Stream):
+            mutate_stream_inplace(val, rng)
+        else:
+            # fallback: change to a new name
+            obj[key] = Name("/MUT" + str(rng.randint(0, 99999)))
+    except Exception:
+        return False
+
+    # occasional add/remove
+    if rng.random() < 0.12:
+        new_key = Name("/MUTKEY" + str(rng.randint(0, 99999)))
+        obj[new_key] = rng.randint(-10000, 10000)
+    if rng.random() < 0.06 and obj.keys():
+        # delete a random key
+        kdel = pick_choice(list(obj.keys()), rng)
+        try:
+            if kdel is not None:
+                del obj[kdel]
+        except Exception:
+            pass
+    return True
+
+
+def mutate_stream_inplace(stream: Stream, rng: random.Random):
+    """
+    Mutate stream bytes in-place (read-modify-write) using rng.
+    """
+    try:
+        # print(stream.__dir__())
+        data = bytearray(stream.read_bytes() or b"")
+    except Exception as e:
+        if "unfilterable" in str(e):
+            data = bytearray(stream.read_raw_bytes() or b"")
+        else:
+            # print("Fuck!!!!")
+            raise(e)
+            return False
+    if not data:
+        # insert small content
+        data = bytearray(b'\x00')
+    choice = rng.randrange(4)
+    if choice == 0:
+        pos = rng.randrange(len(data))
+        data[pos] ^= 0xFF
+    elif choice == 1:
+        pos = rng.randrange(len(data))
+        data.insert(pos, rng.randrange(256))
+    elif choice == 2:
+        start = rng.randrange(len(data))
+        end = min(len(data), start + rng.randint(1, min(16, len(data))))
+        del data[start:end]
+    else:
+        # duplicate a small slice
+        if len(data) >= 2:
+            start = rng.randrange(len(data)-1)
+            end = start + rng.randint(1, min(8, len(data)-start))
+            slicev = data[start:end]
+            where = rng.randrange(len(data))
+            data = data[:where] + slicev + data[where:]
+    try:
+        stream.write(bytes(data))
+        return True
+    except Exception as e:
+        raise(e)
+        return False
+
+
 def choose_target_object(pdf: pikepdf.Pdf, rng: random.Random):
-    # collect candidate objects: Stream and Dictionary
     candidates = []
     for obj in pdf.objects:
         try:
@@ -328,161 +464,227 @@ def choose_target_object(pdf: pikepdf.Pdf, rng: random.Random):
 
 def construct_pike_replacement(py_sample: Dict[str, Any], pdf: pikepdf.Pdf):
     """
-    Convert a py sample (serializable dict) into a replacement object for the target PDF.
-    The function returns either:
-      - a pikepdf.Dictionary
-      - a pikepdf.Stream (or a marker object {"__construct_stream__": {...}} if we couldn't build stream directly)
+    Convert py sample to pike object (or stream-construction marker).
     """
-    pike_obj = py_to_pike(py_sample, pdf=pdf)
-    # If py_to_pike returned the special stream-construction marker, return that marker to the caller so the caller can
-    # create a proper stream on the target pdf.
-    if isinstance(pike_obj, dict) and "__construct_stream__" in pike_obj:
-        return pike_obj
-    return pike_obj
+    return py_to_pike(py_sample, pdf=pdf)
 
 
 def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: random.Random):
     """
-    Replace target_obj (Stream or Dictionary) inline in pdf with sample_py converted.
-    We try to preserve /Length fields correctly for streams.
-    On failure, raise an exception (no fallback).
+    Replace target_obj inline in pdf with sample_py converted.
+    Returns True on success. Raises on unsupported cases.
     """
+    constructed = construct_pike_replacement(sample_py, pdf)
+
+    # Helper to clear dictionary keys safely
+    def clear_dict(d):
+        for k in list(d.keys()):
+            try:
+                del d[k]
+            except Exception:
+                pass
+
+    # Stream target
     if isinstance(target_obj, pikepdf.Stream):
-        # convert sample to stream metadata + bytes
-        constructed = construct_pike_replacement(sample_py, pdf)
         if isinstance(constructed, dict) and "__construct_stream__" in constructed:
             meta = constructed["__construct_stream__"]["dict"]
             data = constructed["__construct_stream__"]["bytes"]
-            # Clear existing stream dict keys except /Length and replace
-            keys = list(target_obj.keys())
-            for k in keys:
+            # remove all metadata except banned keys
+            for k in list(target_obj.keys()):
                 try:
-                    if k != "/Length":
+                    if str(k) not in BANNED_KEYS:
                         del target_obj[k]
                 except Exception:
                     pass
-            # write new bytes
+            # write new bytes and metadata
             target_obj.write(data)
-            # insert metadata
             for kk, vv in meta.items():
-                target_obj[kk] = vv
-            # fix Length
-            target_obj["/Length"] = len(data)
+                # kk is a Name object in the marker; ensure no banned keys
+                kk_str = str(kk) if not isinstance(kk, str) else kk
+                if kk_str in BANNED_KEYS:
+                    continue
+                try:
+                    # if vv is a pike object already or py-serializable
+                    target_obj[Name(kk_str if kk_str.startswith("/") else "/" + kk_str)] = vv
+                except Exception:
+                    try:
+                        target_obj[Name(kk_str if kk_str.startswith("/") else "/" + kk_str)] = py_to_pike(vv, pdf=pdf)
+                    except Exception:
+                        pass
             return True
         elif isinstance(constructed, pikepdf.Stream):
-            # if we got a stream object from py_to_pike, rewrite target stream's bytes and dict
+            # rewrite bytes and copy allowed metadata
             data = constructed.read_bytes() or b""
-            keys = list(target_obj.keys())
-            for k in keys:
+            for k in list(target_obj.keys()):
                 try:
-                    if k != "/Length":
+                    if str(k) not in BANNED_KEYS:
                         del target_obj[k]
                 except Exception:
                     pass
             target_obj.write(data)
             for kk, vv in constructed.items():
-                target_obj[kk] = vv
-            target_obj["/Length"] = len(data)
+                kk_str = str(kk)
+                if kk_str in BANNED_KEYS:
+                    continue
+                try:
+                    target_obj[kk] = vv
+                except Exception:
+                    try:
+                        target_obj[kk] = py_to_pike(pike_to_py(vv), pdf=pdf)
+                    except Exception:
+                        pass
             return True
         elif isinstance(constructed, pikepdf.Dictionary):
-            # create a new stream from the dictionary metadata but with empty bytes
-            keys = list(target_obj.keys())
-            for k in keys:
+            # convert dictionary to stream's metadata with empty bytes
+            for k in list(target_obj.keys()):
                 try:
-                    if k != "/Length":
+                    if str(k) not in BANNED_KEYS:
                         del target_obj[k]
                 except Exception:
                     pass
-            # write zero-length stream (or small filler)
-            data = b""
-            target_obj.write(data)
+            target_obj.write(b"")
             for kk, vv in constructed.items():
-                target_obj[kk] = vv
-            target_obj["/Length"] = 0
+                kk_str = str(kk)
+                if kk_str in BANNED_KEYS:
+                    continue
+                try:
+                    target_obj[kk] = vv
+                except Exception:
+                    pass
             return True
         else:
             raise RuntimeError("Unsupported constructed type for stream replacement: %r" % type(constructed))
 
+    # Dictionary target
     elif isinstance(target_obj, pikepdf.Dictionary):
-        constructed = construct_pike_replacement(sample_py, pdf)
         if isinstance(constructed, pikepdf.Dictionary):
-            # Clear dict and replace keys
-            for k in list(target_obj.keys()):
-                try:
-                    del target_obj[k]
-                except Exception:
-                    pass
+            clear_dict(target_obj)
             for kk, vv in constructed.items():
-                target_obj[kk] = vv
+                try:
+                    target_obj[kk] = vv
+                except Exception:
+                    try:
+                        target_obj[kk] = py_to_pike(pike_to_py(vv), pdf=pdf)
+                    except Exception:
+                        pass
             return True
         elif isinstance(constructed, dict) and "__construct_stream__" in constructed:
-            # replace a dictionary with a stream's dict (ok)
-            for k in list(target_obj.keys()):
-                try:
-                    del target_obj[k]
-                except Exception:
-                    pass
+            clear_dict(target_obj)
             meta = constructed["__construct_stream__"]["dict"]
             for kk, vv in meta.items():
-                target_obj[kk] = vv
+                kk_str = str(kk) if not isinstance(kk, str) else kk
+                kname = Name(kk_str if kk_str.startswith("/") else "/" + kk_str)
+                try:
+                    target_obj[kname] = vv
+                except Exception:
+                    try:
+                        target_obj[kname] = py_to_pike(vv, pdf=pdf)
+                    except Exception:
+                        pass
             return True
         elif isinstance(constructed, pikepdf.Stream):
-            # a stream can't be inserted as a dictionary; but we can copy its stream_dict keys into dict
-            sdict = Dictionary()
+            # copy stream's stream_dict entries into dict
+            clear_dict(target_obj)
             for kk, vv in constructed.items():
-                sdict[kk] = vv
-            for k in list(target_obj.keys()):
                 try:
-                    del target_obj[k]
+                    target_obj[kk] = vv
                 except Exception:
                     pass
-            for kk, vv in sdict.items():
-                target_obj[kk] = vv
             return True
         else:
-            raise RuntimeError("Unsupported constructed type for dictionary replacement: %r" % type(constructed))
+            raise RuntimeError("Unsupported constructed type for dict replacement: %r" % type(constructed))
+
     else:
         raise RuntimeError("Unsupported target_obj type: %r" % type(target_obj))
 
 
 # -----------------------------
-# Mutate whole PDF bytes
+# Mutate whole PDF bytes (combining replacement + in-place edits)
 # -----------------------------
 def mutate_pdf_structural(buf: bytes, max_size: int, rng: random.Random) -> bytes:
     """
-    Parse the PDF from buf (bytes), choose a target object and replace it using resources DB.
-    Return mutated bytes (<= max_size).
-    Raises on parse/convert errors instead of falling back silently.
+    Parse the PDF, choose a target object and perform:
+      - replacement (sample from resources DB) OR
+      - in-place mutation of object (dict/stream) OR
+      - shuffle pages
+    Decisions are deterministic from rng.
+    Raises on parse/convert errors (no silent fallback).
     """
-    # parse PDF bytes using pikepdf
-    pdf_stream = io.BytesIO(buf)
     try:
-        pdf = pikepdf.open(pdf_stream, allow_overwriting_input=True)
+        pdf = pikepdf.open(io.BytesIO(buf))
     except Exception as e:
         raise RuntimeError("pikepdf failed to open input: %s" % e)
 
-    # choose a replacement sample
     if not _resources_db:
-        raise RuntimeError("resources DB is empty; cannot perform structural mutation")
+        raise RuntimeError("empty resources DB")
 
-    # pick target
-    target = choose_target_object(pdf, rng)
-    if target is None:
-        raise RuntimeError("no candidate objects found in PDF for replacement")
+    # Decide action: weights
+    # 0-49 => replace object (50%)
+    # 50-79 => mutate object in-place (30%)
+    # 80-99 => shuffle/structural (20%)
+    action_roll = rng.randrange(100)
 
-    sample_py = rng.choice(_resources_db)
-    # attempt replacement
-    ok = replace_object_with_sample(pdf, target, sample_py, rng)
-    if not ok:
-        raise RuntimeError("replacement did not succeed for unknown reason")
+    # Replacement path
+    if action_roll < 50:
+        target = choose_target_object(pdf, rng)
+        if target is None:
+            raise RuntimeError("no candidate objects found for replacement")
+        sample_py = rng.choice(_resources_db)
+        ok = replace_object_with_sample(pdf, target, sample_py, rng)
+        if not ok:
+            raise RuntimeError("replacement failed")
+    # In-place mutation path
+    elif action_roll < 100:
+        target = choose_target_object(pdf, rng)
+        if target is None:
+            raise RuntimeError("no candidate objects found for in-place mutation")
+        if isinstance(target, pikepdf.Stream):
+            ok = mutate_stream_inplace(target, rng)
+            if not ok:
+                raise RuntimeError("stream mutate failed")
+        elif isinstance(target, pikepdf.Dictionary):
+            ok = mutate_dict_inplace(target, rng)
+            if not ok:
+                raise RuntimeError("dict mutate failed")
+        else:
+            raise RuntimeError("unsupported target for inplace mutation")
+    # Structural / page operations
+    else:
+        # shuffle pages occasionally
+        pages = list(pdf.pages)
+        if len(pages) > 1:
+            # deterministic shuffle by rng
+            perm = list(range(len(pages)))
+            # perform a small number of swaps depending on rng
+            swap_count = 1 + (rng.randrange(min(5, len(pages))))
+            for _ in range(swap_count):
+                i = rng.randrange(len(pages))
+                j = rng.randrange(len(pages))
+                perm[i], perm[j] = perm[j], perm[i]
+            # apply permutation
+            new_pages = [pages[i] for i in perm]
+            # pdf.pages.clear()
+            for p in new_pages:
+                pdf.pages.append(p)
+        else:
+            # fallback structural edit: replace resources object if present
+            for obj in pdf.objects:
+                try:
+                    if isinstance(obj, pikepdf.Dictionary) and (set(k.strip("/") for k in obj.keys()) & {"Font", "XObject"}):
+                        sample_py = rng.choice(_resources_db)
+                        replace_object_with_sample(pdf, obj, sample_py, rng)
+                        break
+                except Exception:
+                    pass
 
-    # Save to bytes
+    # Save mutated PDF to bytes
     out_buf = io.BytesIO()
-    # Try to avoid recompression to preserve what we set: pikepdf save options
-    pdf.save(out_buf, linearize=False, compress_streams=False)
+    try:
+        pdf.save(out_buf, linearize=False, compress_streams=False)
+    except Exception as e:
+        raise RuntimeError("pikepdf.save failed: %s" % e)
     data = out_buf.getvalue()
     if len(data) > max_size:
-        # truncate
         data = data[:max_size]
     return data
 
@@ -490,39 +692,39 @@ def mutate_pdf_structural(buf: bytes, max_size: int, rng: random.Random) -> byte
 # -----------------------------
 # Generic fallback mutator (kept but NOT used as fallback per request)
 # -----------------------------
-def remove_substring(b: bytes) -> bytes:
+def remove_substring(b: bytes, rng: random.Random) -> bytes:
     if len(b) < 2:
         return b
-    start = random.randrange(len(b)-1)
-    end = random.randrange(start+1, len(b))
+    start = rng.randrange(len(b)-1)
+    end = rng.randrange(start+1, len(b))
     return b[:start] + b[end:]
 
 
-def multiply_substring(b: bytes) -> bytes:
+def multiply_substring(b: bytes, rng: random.Random) -> bytes:
     if len(b) < 2:
         return b
-    start = random.randrange(len(b)-1)
-    end = random.randrange(start+1, len(b))
+    start = rng.randrange(len(b)-1)
+    end = rng.randrange(start+1, len(b))
     substr = b[start:end]
-    where = random.randrange(len(b))
-    return b[:where] + substr * random.randint(1, 5) + b[where:]
+    where = rng.randrange(len(b))
+    return b[:where] + substr * (1 + rng.randrange(4)) + b[where:]
 
 
-def add_character(b: bytes) -> bytes:
-    where = random.randrange(len(b)) if b else 0
-    return b[:where] + bytes([random.randrange(256)]) + b[where:]
+def add_character(b: bytes, rng: random.Random) -> bytes:
+    where = rng.randrange(len(b)) if b else 0
+    return b[:where] + bytes([rng.randrange(256)]) + b[where:]
 
 
-def mutate_generic(b: bytes) -> bytes:
+def mutate_generic(b: bytes, rng: random.Random) -> bytes:
     if not b:
-        return bytes([random.randrange(256)])
-    choice = random.randrange(3)
+        return bytes([rng.randrange(256)])
+    choice = rng.randrange(3)
     if choice == 0:
-        return remove_substring(b)
+        return remove_substring(b, rng)
     elif choice == 1:
-        return multiply_substring(b)
+        return multiply_substring(b, rng)
     else:
-        return add_character(b)
+        return add_character(b, rng)
 
 
 # -----------------------------
@@ -531,18 +733,12 @@ def mutate_generic(b: bytes) -> bytes:
 def init(seed: int):
     """
     Called once by AFL at startup with a seed.
-    We load resources DB and initialize any global structures.
+    We load resources DB but do NOT use the provided seed for per-input mutation randomness.
     """
     global _initialized, _resources_db, _mutation_count
 
     if _initialized:
         return
-
-    # set mutation count
-    try:
-        seed = int(seed)
-    except Exception:
-        seed = 0
 
     # Load resources DB from pickle or PDF dir
     try:
@@ -558,7 +754,6 @@ def init(seed: int):
 def deinit():
     global _initialized
     _initialized = False
-    # nothing else to cleanup
 
 
 def fuzz_count(buf: bytearray) -> int:
@@ -566,7 +761,6 @@ def fuzz_count(buf: bytearray) -> int:
     Return how many fuzz cycles to perform for this buffer.
     If the buffer cannot be parsed as a PDF (pikepdf), return 0 to skip mutating.
     """
-    # make sure header length is present
     if not isinstance(buf, (bytes, bytearray)):
         return 0
     if len(buf) <= HEADER_SIZE:
@@ -575,9 +769,8 @@ def fuzz_count(buf: bytearray) -> int:
     try:
         core = bytes(buf[HEADER_SIZE:])
         with pikepdf.open(io.BytesIO(core)) as pdf:
-            # may be large; only need to know open succeeded
-            pass
-        return _mutation_count
+            # open succeeded; schedule mutations
+            return _mutation_count
     except Exception:
         # invalid PDFs we don't attempt to mutate structurally
         return 0
@@ -585,10 +778,9 @@ def fuzz_count(buf: bytearray) -> int:
 
 def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
     """
-    Perform a single mutation. buf is a bytes/bytearray input.
-    We will preserve HEADER_SIZE bytes and mutate the rest.
-    Returns a bytes-like (bytearray) mutated output.
-    On failure, raises an exception (no fallback).
+    Perform a single mutation. buf is bytes/bytearray input.
+    Preserve HEADER_SIZE bytes and mutate the rest.
+    Raises on structural failure (no silent fallback).
     """
     if not _initialized:
         raise RuntimeError("mutator not initialized; call init(seed) before fuzz()")
@@ -602,17 +794,12 @@ def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
     header = bytes(buf[:HEADER_SIZE])
     core = bytes(buf[HEADER_SIZE:])
 
-    # Build deterministic RNG from core bytes (so mutation decisions are derived from buf)
-    rng = rng_from_buf(buf)
+    rng = rng_from_buf(bytes(buf))  # deterministic RNG from buffer
 
-    # perform structural mutation; if anything fails we raise an exception
     mutated_core = mutate_pdf_structural(core, max_size - HEADER_SIZE, rng)
-
-    # combine header back
     out = bytearray()
     out.extend(header)
     out.extend(mutated_core)
-    # truncate to max_size if necessary
     if len(out) > max_size:
         out = out[:max_size]
     return out
@@ -634,24 +821,22 @@ def cli_mutate_file(infile: str, outfile: str, times: int = 1):
     """
     with open(infile, "rb") as fh:
         data = fh.read()
-    # add header if not present
     if len(data) <= HEADER_SIZE:
         data = (b"\x00" * HEADER_SIZE) + data
     else:
-        # Prepend a 4-byte header for testing
         data = b"\x00\x00\x00\x00" + data
 
     for i in range(times):
-        rng = rng_from_buf(data)
-        mutated = fuzz(data, None, 10_000_000)
+        mutated = fuzz(bytearray(data), None, 10_000_000)
         data = bytes(mutated)
+        with open(f"{outfile}.{i}", "wb") as fh:
+            fh.write(data)
     with open(outfile, "wb") as fh:
         fh.write(data)
     print(f"Wrote mutated output to {outfile}")
 
 
 if __name__ == "__main__":
-    # small CLI front-end
     import argparse
     ap = argparse.ArgumentParser(description="Mutator maintenance / testing")
     ap.add_argument("--build-db", action="store_true", help="Build resources.pkl from MUTATOR_PDF_DIR")
@@ -667,7 +852,6 @@ if __name__ == "__main__":
 
     if args.mutate:
         infile, outfile = args.mutate
-        # ensure mutator init
         init(0)
         try:
             cli_mutate_file(infile, outfile, times=1)
