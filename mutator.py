@@ -41,7 +41,7 @@ except Exception as e:
 # Config / Globals
 # -----------------------------
 HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
-DEFAULT_MUTATION_COUNT = 1000
+DEFAULT_MUTATION_COUNT = 100
 MAX_DB_SIZE = 1000
 MAX_CALL_COUNT = 200000
 BANNED_KEYS = set(["/Length", "/Kids"])  # Do not modify these on stream dicts
