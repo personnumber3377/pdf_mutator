@@ -354,12 +354,14 @@ def rng_from_buf(buf: bytes) -> random.Random:
     Create a deterministic RNG seeded from the input buffer bytes (excluding header).
     Use a stable hash of a slice to seed the RNG.
     """
-    raw = buf[HEADER_SIZE:HEADER_SIZE + 128]
-    if not raw:
-        raw = buf[:HEADER_SIZE] or b"\x00"
-    h = hashlib.sha256(raw).digest()
-    seed_int = int.from_bytes(h[:8], "little")
-    return random.Random(random.randrange(1,1000)) # random.Random(random.randrange(1000000)) # random.Random(seed_int)
+    # raw = buf[HEADER_SIZE:HEADER_SIZE + 128]
+    # if not raw:
+    #     raw = buf[:HEADER_SIZE] or b"\x00"
+    # h = hashlib.sha256(raw).digest()
+    # seed_int = int.from_bytes(h[:8], "little")
+    # seed_thing = random.randrange(1,1000)
+    # print("seed: "+str(seed_thing))
+    return random.Random(len(buf)) # random.Random(seed_int) # random.Random(seed_thing) # random.Random(random.randrange(1000000)) # random.Random(seed_int)
 
 
 # -----------------------------
@@ -369,67 +371,6 @@ def pick_choice(seq, rng: random.Random):
     if not seq:
         return None
     return seq[rng.randrange(len(seq))]
-
-'''
-def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0):
-    """
-    Mutate a pikepdf.Dictionary in-place using type-aware operations.
-    Uses `rng` for all randomness.
-    """
-    if not isinstance(obj, Dictionary) or not obj.keys():
-        return False
-    keys = list(obj.keys())
-    key = pick_choice(keys, rng)
-    if key is None:
-        return False
-    expected = DICT_TYPE_MAP.get(str(key).lstrip("/"), "any")
-    try:
-        val = obj[key]
-        # int
-        if expected == "int" and isinstance(val, int):
-            obj[key] = val + rng.randint(-2000, 2000)
-        elif expected == "number" and isinstance(val, (int, float)):
-            # scale
-            factor = 1.0 + (rng.random() - 0.5) * 2.0
-            obj[key] = float(val) * factor
-        elif expected == "array" and isinstance(val, Array):
-            if len(val) > 0 and isinstance(val[0], int):
-                idx = rng.randrange(len(val))
-                val[idx] = val[idx] + rng.randint(-500, 500)
-            else:
-                # append small int
-                val.append(rng.randint(-1000, 1000))
-        elif expected == "name":
-            obj[key] = Name("/MUT" + str(rng.randint(0, 99999)))
-        elif expected == "bool":
-            obj[key] = not bool(val)
-        elif expected == "string":
-            s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, 12)))
-            obj[key] = s
-        elif expected == "dict" and isinstance(val, Dictionary) and depth < MAX_RECURSION:
-            mutate_dict_inplace(val, rng, depth+1)
-        elif expected == "stream" and isinstance(val, Stream):
-            mutate_stream_inplace(val, rng)
-        else:
-            # fallback: change to a new name
-            obj[key] = Name("/MUT" + str(rng.randint(0, 99999)))
-    except Exception:
-        return False
-
-    # occasional add/remove
-    if rng.random() < 0.12:
-        new_key = Name("/MUTKEY" + str(rng.randint(0, 99999)))
-        obj[new_key] = rng.randint(-10000, 10000)
-    if rng.random() < 0.06 and obj.keys():
-        # delete a random key
-        kdel = pick_choice(list(obj.keys()), rng)
-        try:
-            if kdel is not None:
-                del obj[kdel]
-        except Exception:
-            pass
-    return True
-'''
 
 def collect_named_objects(pdf) -> List[Name]:
     """
@@ -462,6 +403,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
     If pdf is passed, uses it to pick valid object/name references.
     """
     if not isinstance(obj, Dictionary) or not obj.keys():
+        # assert False
         return False
     keys = list(obj.keys())
     key = pick_choice(keys, rng)
@@ -487,7 +429,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
                 val.append(rng.randint(-1000, 1000))
 
         elif expected == "name":
-            if pdf is not None and rng.random() < 0.8:
+            if pdf is not None:
                 # replace with a real name from the PDF
                 valid_names = collect_named_objects(pdf)
                 obj[key] = rng.choice(valid_names)
@@ -519,7 +461,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
 
     # occasionally add/remove entries
     if rng.random() < 0.12:
-        if pdf is not None and rng.random() < 0.7:
+        if pdf is not None:
             # add a valid-looking key
             new_key = rng.choice(collect_named_objects(pdf))
             obj[new_key] = rng.randint(-10000, 10000)
@@ -775,9 +717,14 @@ def mutate_pdf_structural(buf: bytes, max_size: int, rng: random.Random) -> byte
             if not ok:
                 raise RuntimeError("stream mutate failed")
         elif isinstance(target, pikepdf.Dictionary):
-            ok = mutate_dict_inplace(target, rng, pdf=pdf)
-            if not ok:
-                raise RuntimeError("dict mutate failed")
+            ok = False
+            count = 10
+            for i in range(count):
+                ok = mutate_dict_inplace(target, rng, pdf=pdf)
+                if ok:
+                    break
+            # if not ok:
+            #     raise RuntimeError("dict mutate failed")
         else:
             raise RuntimeError("unsupported target for inplace mutation")
     # Structural / page operations
@@ -961,8 +908,8 @@ def cli_mutate_file(infile: str, outfile: str, times: int = 1):
     for i in range(times):
         mutated = fuzz(bytearray(data), None, 10_000_000)
         data = bytes(mutated)
-        with open(f"{outfile}.{i}", "wb") as fh:
-            fh.write(data)
+        # with open(f"{outfile}.{i}", "wb") as fh:
+        #     fh.write(data)
     with open(outfile, "wb") as fh:
         fh.write(data)
     print(f"Wrote mutated output to {outfile}")
