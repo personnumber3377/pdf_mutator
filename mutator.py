@@ -44,7 +44,7 @@ HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
 DEFAULT_MUTATION_COUNT = 1000
 MAX_DB_SIZE = 1000
 MAX_CALL_COUNT = 200000
-BANNED_KEYS = set(["/Length"])  # Do not modify these on stream dicts
+BANNED_KEYS = set(["/Length", "/Kids"])  # Do not modify these on stream dicts
 MAX_RECURSION = 8
 
 DEFAULT_PDF_DIR = Path(os.environ.get("MUTATOR_PDF_DIR", "./pdf_seed_corpus/"))
@@ -129,7 +129,8 @@ def pike_to_py(obj: Any, depth: int = 0) -> Dict[str, Any]:
         for k, v in obj.items():
             try:
                 out[str(k)] = pike_to_py(v, depth=depth+1)
-            except Exception:
+            except Exception as e:
+                raise(e)
                 out[str(k)] = {"__type__": "unknown"}
         return {"__type__": "dict", "value": out}
 
@@ -138,7 +139,8 @@ def pike_to_py(obj: Any, depth: int = 0) -> Dict[str, Any]:
         for v in obj:
             try:
                 lst.append(pike_to_py(v, depth=depth+1))
-            except Exception:
+            except Exception as e:
+                raise(e)
                 lst.append({"__type__": "unknown"})
         return {"__type__": "array", "value": lst}
 
@@ -173,14 +175,14 @@ def py_to_pike(pyobj: Any, pdf: pikepdf.Pdf = None) -> Any:
 
     t = pyobj["__type__"]
 
-    if t in ("name", "unknown"):
+    if t in ("name"):
         v = pyobj.get("value", "")
         if not isinstance(v, str):
             v = str(v)
         if not v.startswith("/"):
             v = "/" + v
-        if len(v) == 1:
-            v = v + "A"
+        # if len(v) == 1:
+        #     v = v + "A"
         return Name(v)
 
     if t == "primitive":
@@ -344,7 +346,7 @@ def pick_choice(seq, rng: random.Random):
         return None
     return seq[rng.randrange(len(seq))]
 
-
+'''
 def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0):
     """
     Mutate a pikepdf.Dictionary in-place using type-aware operations.
@@ -403,7 +405,113 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0):
         except Exception:
             pass
     return True
+'''
 
+def collect_named_objects(pdf) -> List[Name]:
+    """
+    Collect all Name keys that look like indirect references or valid names
+    inside the current PDF. Used to generate replacements instead of nonsense.
+    """
+    names = []
+    try:
+        for obj in pdf.objects:
+            if isinstance(obj, Dictionary):
+                for k, v in obj.items():
+                    if isinstance(v, Name):
+                        names.append(v)
+            elif isinstance(obj, Array):
+                for v in obj:
+                    if isinstance(v, Name):
+                        names.append(v)
+    except Exception:
+        pass
+    # fallback if nothing found
+    if not names:
+        names = [Name("/Fallback")]
+    return names
+
+
+def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf=None):
+    """
+    Mutate a pikepdf.Dictionary in-place using type-aware operations.
+    Uses `rng` for all randomness.
+    If pdf is passed, uses it to pick valid object/name references.
+    """
+    if not isinstance(obj, Dictionary) or not obj.keys():
+        return False
+    keys = list(obj.keys())
+    key = pick_choice(keys, rng)
+    if key is None:
+        return False
+    expected = DICT_TYPE_MAP.get(str(key).lstrip("/"), "any")
+
+    try:
+        val = obj[key]
+        # int
+        if expected == "int" and isinstance(val, int):
+            obj[key] = val + rng.randint(-2000, 2000)
+
+        elif expected == "number" and isinstance(val, (int, float)):
+            factor = 1.0 + (rng.random() - 0.5) * 2.0
+            obj[key] = float(val) * factor
+
+        elif expected == "array" and isinstance(val, Array):
+            if len(val) > 0 and isinstance(val[0], int):
+                idx = rng.randrange(len(val))
+                val[idx] = val[idx] + rng.randint(-500, 500)
+            else:
+                val.append(rng.randint(-1000, 1000))
+
+        elif expected == "name":
+            if pdf is not None and rng.random() < 0.8:
+                # replace with a real name from the PDF
+                valid_names = collect_named_objects(pdf)
+                obj[key] = rng.choice(valid_names)
+            else:
+                obj[key] = Name("/Alt" + str(rng.randint(0, 99999)))
+
+        elif expected == "bool":
+            obj[key] = not bool(val)
+
+        elif expected == "string":
+            s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, 12)))
+            obj[key] = s
+
+        elif expected == "dict" and isinstance(val, Dictionary) and depth < MAX_RECURSION:
+            mutate_dict_inplace(val, rng, depth + 1, pdf=pdf)
+
+        elif expected == "stream" and isinstance(val, Stream):
+            mutate_stream_inplace(val, rng)
+
+        else:
+            # fallback: reference an existing name instead of nonsense
+            if pdf is not None:
+                obj[key] = rng.choice(collect_named_objects(pdf))
+            else:
+                obj[key] = Name("/Alt" + str(rng.randint(0, 99999)))
+
+    except Exception:
+        return False
+
+    # occasionally add/remove entries
+    if rng.random() < 0.12:
+        if pdf is not None and rng.random() < 0.7:
+            # add a valid-looking key
+            new_key = rng.choice(collect_named_objects(pdf))
+            obj[new_key] = rng.randint(-10000, 10000)
+        else:
+            new_key = Name("/MutExtra" + str(rng.randint(0, 99999)))
+            obj[new_key] = rng.randint(-10000, 10000)
+
+    if rng.random() < 0.06 and obj.keys():
+        kdel = pick_choice(list(obj.keys()), rng)
+        try:
+            if kdel is not None:
+                del obj[kdel]
+        except Exception:
+            pass
+
+    return True
 
 def mutate_stream_inplace(stream: Stream, rng: random.Random):
     """
@@ -643,7 +751,7 @@ def mutate_pdf_structural(buf: bytes, max_size: int, rng: random.Random) -> byte
             if not ok:
                 raise RuntimeError("stream mutate failed")
         elif isinstance(target, pikepdf.Dictionary):
-            ok = mutate_dict_inplace(target, rng)
+            ok = mutate_dict_inplace(target, rng, pdf=pdf)
             if not ok:
                 raise RuntimeError("dict mutate failed")
         else:

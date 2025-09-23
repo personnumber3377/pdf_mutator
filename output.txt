@@ -1,1 +1,1 @@
-Built DB with 538 samples; saved to resources.pkl
+Built DB with 71 samples; saved to resources.pkl
