@@ -274,6 +274,30 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
         print(f"Warning: failed to open {pdf_path}: {e}", file=sys.stderr)
     return samples
 
+# def obj_to_dict(obj) -> dict: # Convert object to dictionary...
+
+
+def is_critical_object(obj, pdf) -> bool:
+    try:
+        # Catalog (Root is the Catalog in PDFs)
+        if "/Type" in obj and str(obj["/Type"]) == "/Catalog":
+            return True
+        if "/Type" in obj and str(obj["/Type"]) == "/Pages":
+            # print("stuff")
+            # print(obj)
+            # print(obj["/Kids"])
+            return True
+        if "/Kids" in obj:
+            return True
+        # Root dictionary
+        if obj == pdf.root:
+            return True
+        # Pages dictionary
+        if "/Pages" in pdf.root and obj == pdf.root["/Pages"]:
+            return True
+    except Exception:
+        return False
+    return False
 
 def build_resources_db_from_dir(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
     db: List[Dict[str, Any]] = []
@@ -561,7 +585,7 @@ def choose_target_object(pdf: pikepdf.Pdf, rng: random.Random):
     candidates = []
     for obj in pdf.objects:
         try:
-            if isinstance(obj, (pikepdf.Stream, pikepdf.Dictionary)):
+            if isinstance(obj, (pikepdf.Stream, pikepdf.Dictionary)) and not is_critical_object(obj, pdf):
                 candidates.append(obj)
         except Exception:
             continue
