@@ -361,7 +361,7 @@ def rng_from_buf(buf: bytes) -> random.Random:
     # seed_int = int.from_bytes(h[:8], "little")
     # seed_thing = random.randrange(1,1000)
     # print("seed: "+str(seed_thing))
-    return random.Random(len(buf)) # random.Random(seed_int) # random.Random(seed_thing) # random.Random(random.randrange(1000000)) # random.Random(seed_int)
+    return random.Random(random.randrange(1,10000000)) # random.Random(len(buf)) # random.Random(seed_int) # random.Random(seed_thing) # random.Random(random.randrange(1000000)) # random.Random(seed_int)
 
 
 # -----------------------------
