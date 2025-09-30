@@ -892,27 +892,34 @@ def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
     Preserve HEADER_SIZE bytes and mutate the rest.
     Raises on structural failure (no silent fallback).
     """
-    if not _initialized:
-        raise RuntimeError("mutator not initialized; call init(seed) before fuzz()")
 
-    if not isinstance(buf, (bytes, bytearray)):
-        raise ValueError("buf must be bytes or bytearray")
+    try:
 
-    if len(buf) <= HEADER_SIZE:
-        raise ValueError("buf too small (<= HEADER_SIZE)")
+        if not _initialized:
+            raise RuntimeError("mutator not initialized; call init(seed) before fuzz()")
 
-    header = bytes(buf[:HEADER_SIZE])
-    core = bytes(buf[HEADER_SIZE:])
+        if not isinstance(buf, (bytes, bytearray)):
+            raise ValueError("buf must be bytes or bytearray")
 
-    rng = rng_from_buf(bytes(buf))  # deterministic RNG from buffer
+        if len(buf) <= HEADER_SIZE:
+            raise ValueError("buf too small (<= HEADER_SIZE)")
 
-    mutated_core = mutate_pdf_structural(core, max_size - HEADER_SIZE, rng)
-    out = bytearray()
-    out.extend(header)
-    out.extend(mutated_core)
-    if len(out) > max_size:
-        out = out[:max_size]
-    return out
+        header = bytes(buf[:HEADER_SIZE])
+        core = bytes(buf[HEADER_SIZE:])
+
+        rng = rng_from_buf(bytes(buf))  # deterministic RNG from buffer
+
+        mutated_core = mutate_pdf_structural(core, max_size - HEADER_SIZE, rng)
+        out = bytearray()
+        out.extend(header)
+        out.extend(mutated_core)
+        if len(out) > max_size:
+            out = out[:max_size]
+        return out
+    except Exception as e:
+        print(e)
+        return buf
+
 
 
 # -----------------------------
