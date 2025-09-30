@@ -42,7 +42,7 @@ except Exception as e:
 # -----------------------------
 HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
 DEFAULT_MUTATION_COUNT = 100
-MAX_DB_SIZE = 1000
+MAX_DB_SIZE = 30000
 MAX_CALL_COUNT = 200000
 BANNED_KEYS = set(["/Length", "/Kids"])  # Do not modify these on stream dicts
 MAX_RECURSION = 8
@@ -237,6 +237,7 @@ def py_to_pike(pyobj: Any, pdf: pikepdf.Pdf = None) -> Any:
 # -----------------------------
 # Build / load resources DB
 # -----------------------------
+'''
 def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
     """
     Extract resource-like dictionaries from a single PDF file.
@@ -270,6 +271,35 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
                             samples.append(pike_to_py(sd))
                 except Exception:
                     pass
+    except Exception as e:
+        print(f"Warning: failed to open {pdf_path}: {e}", file=sys.stderr)
+    return samples
+'''
+
+def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
+    """
+    Extract arbitrary objects from a PDF file.
+    Not limited to resources; captures any Dictionary, Array, or Stream.
+    """
+    samples = []
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            # always try page resources first (still useful)
+            for p in pdf.pages:
+                try:
+                    r = p.get("/Resources")
+                    if r:
+                        samples.append(pike_to_py(r))
+                except Exception:
+                    pass
+
+            # now grab arbitrary objects
+            for obj in pdf.objects:
+                try:
+                    if isinstance(obj, (pikepdf.Dictionary, pikepdf.Array, pikepdf.Stream)):
+                        samples.append(pike_to_py(obj))
+                except Exception:
+                    continue
     except Exception as e:
         print(f"Warning: failed to open {pdf_path}: {e}", file=sys.stderr)
     return samples
@@ -309,6 +339,7 @@ def build_resources_db_from_dir(pdf_dir: Path, pkl_path: Path) -> List[Dict[str,
         if not p.is_file() or p.suffix.lower() != ".pdf":
             continue
         try:
+            print(p.name)
             samples = extract_resource_samples_from_pdf(p)
             if samples:
                 db.extend(samples)
