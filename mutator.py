@@ -38,6 +38,17 @@ except Exception as e:
     raise
 
 # -----------------------------
+# For debugging
+# -----------------------------
+
+DEBUG = False
+
+def dprint(msg: str) -> None:
+    if DEBUG:
+        print("[DEBUG] "+str(msg))
+    return
+
+# -----------------------------
 # Config / Globals
 # -----------------------------
 HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
@@ -514,6 +525,7 @@ def mutate_stream_inplace(stream: Stream, rng: random.Random):
     """
     Mutate stream bytes in-place (read-modify-write) using rng.
     """
+    dprint("Mutating stream!!!")
     try:
         # print(stream.__dir__())
         data = bytearray(stream.read_bytes() or b"")
@@ -579,7 +591,11 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
     Replace target_obj inline in pdf with sample_py converted.
     Returns True on success. Raises on unsupported cases.
     """
+    dprint("Replacing object...")
+
     constructed = construct_pike_replacement(sample_py, pdf)
+
+    dprint("constructed: "+str(constructed))
 
     # Helper to clear dictionary keys safely
     def clear_dict(d):
@@ -615,6 +631,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     try:
                         target_obj[Name(kk_str if kk_str.startswith("/") else "/" + kk_str)] = py_to_pike(vv, pdf=pdf)
                     except Exception:
+                        dprint("Exception!!!")
                         pass
             return True
         elif isinstance(constructed, pikepdf.Stream):
@@ -625,6 +642,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     if str(k) not in BANNED_KEYS:
                         del target_obj[k]
                 except Exception:
+                    dprint("Exception!!!")
                     pass
             target_obj.write(data)
             for kk, vv in constructed.items():
@@ -637,6 +655,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     try:
                         target_obj[kk] = py_to_pike(pike_to_py(vv), pdf=pdf)
                     except Exception:
+                        dprint("Exception!!!")
                         pass
             return True
         elif isinstance(constructed, pikepdf.Dictionary):
@@ -646,6 +665,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     if str(k) not in BANNED_KEYS:
                         del target_obj[k]
                 except Exception:
+                    dprint("Exception!!!")
                     pass
             target_obj.write(b"")
             for kk, vv in constructed.items():
@@ -655,6 +675,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                 try:
                     target_obj[kk] = vv
                 except Exception:
+                    dprint("Exception!!!")
                     pass
             return True
         else:
@@ -671,6 +692,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     try:
                         target_obj[kk] = py_to_pike(pike_to_py(vv), pdf=pdf)
                     except Exception:
+                        dprint("Exception!!!")
                         pass
             return True
         elif isinstance(constructed, dict) and "__construct_stream__" in constructed:
@@ -685,6 +707,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                     try:
                         target_obj[kname] = py_to_pike(vv, pdf=pdf)
                     except Exception:
+                        dprint("Exception!!!")
                         pass
             return True
         elif isinstance(constructed, pikepdf.Stream):
@@ -694,6 +717,7 @@ def replace_object_with_sample(pdf: pikepdf.Pdf, target_obj, sample_py, rng: ran
                 try:
                     target_obj[kk] = vv
                 except Exception:
+                    dprint("Exception!!!")
                     pass
             return True
         else:
