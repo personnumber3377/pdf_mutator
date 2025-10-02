@@ -485,7 +485,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
             else:
                 # Mutate here any element for example remove elements or modify (aka remove and then add at the same index)
                 # val.append(rng.randint(-MAX_INTEGER_RANGE, MAX_INTEGER_RANGE))
-
+                val.append(rng.randint(-MAX_INTEGER_RANGE, MAX_INTEGER_RANGE))
         elif expected == "name":
             if pdf is not None:
                 # replace with a real name from the PDF
