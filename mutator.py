@@ -43,7 +43,7 @@ except Exception as e:
 
 # DEBUG = False
 
-DEBUG = True
+DEBUG = False
 
 def dprint(msg: str) -> None:
     if DEBUG:
@@ -524,7 +524,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
                     if isinstance(elem, int):
                         val[idx] = elem + rng.randint(-100, 100)
                     elif isinstance(elem, float):
-                        val[idx] = elem * (1.0 + rng.random())
+                        val[idx] = elem * (1.0 + rng.random()) * MAX_SCALE_FACTOR
                     elif isinstance(elem, str):
                         s = elem
                         if len(s) > 1:
@@ -1177,8 +1177,8 @@ def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
             out = out[:max_size]
         return out
     except Exception as e:
-        # print(e)
-        raise e
+        print(e)
+        # raise e
         return buf
 
 
