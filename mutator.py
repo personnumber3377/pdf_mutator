@@ -41,7 +41,9 @@ except Exception as e:
 # For debugging
 # -----------------------------
 
-DEBUG = False
+# DEBUG = False
+
+DEBUG = True
 
 def dprint(msg: str) -> None:
     if DEBUG:
@@ -55,8 +57,14 @@ HEADER_SIZE = 4  # keep header bytes unchanged in mutated output
 DEFAULT_MUTATION_COUNT = 100
 MAX_DB_SIZE = 30000
 MAX_CALL_COUNT = 200000
+MAX_STRING_SIZE = 10000
+
+MAX_INTEGER_RANGE = 2**32 - 1
+
 BANNED_KEYS = set(["/Length", "/Kids"])  # Do not modify these on stream dicts
 MAX_RECURSION = 8
+
+MAX_SCALE_FACTOR = 1000.0 # The max float scale factor
 
 DEFAULT_PDF_DIR = Path(os.environ.get("MUTATOR_PDF_DIR", "./pdf_seed_corpus/"))
 DEFAULT_PKL_PATH = Path(os.environ.get("MUTATOR_PKL_PATH", "./resources.pkl"))
@@ -308,7 +316,14 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
             for obj in pdf.objects:
                 try:
                     if isinstance(obj, (pikepdf.Dictionary, pikepdf.Array, pikepdf.Stream)):
-                        samples.append(pike_to_py(obj))
+                        the_thing = pike_to_py(obj)
+                        # Check if the thing is an empty result, if yes, then do not add it...
+                        if the_thing["__type__"] == "stream": # Check stream
+                            # dprint("the thing: "+str(the_thing))
+                            # dprint("length of the bullshit: "+str(len(the_thing["stream_bytes"])))
+                            if len(the_thing["stream_bytes"]) == 0: # Check empty stuff...
+                                continue # Continue if we have the shit...
+                        samples.append(the_thing)
                 except Exception:
                     continue
     except Exception as e:
@@ -460,15 +475,16 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
             obj[key] = val + rng.randint(-2000, 2000)
 
         elif expected == "number" and isinstance(val, (int, float)):
-            factor = 1.0 + (rng.random() - 0.5) * 2.0
+            factor = 1.0 + (rng.random() - 0.5) * MAX_SCALE_FACTOR # originally this was just 2.0
             obj[key] = float(val) * factor
 
-        elif expected == "array" and isinstance(val, Array):
+        elif expected == "array" and isinstance(val, Array): # This part here needs to be modified to actually mutate the values and also support adding other types other than integers for example there are multitype arrays such as these: [ /PDF /Text /ImageB /ImageC /ImageI ] and [ 6 0 R ] and you can do this by just copying an element from the list and adding a copy of it into the thing or you can lookup the dictionary too. I want to support any type of variable thing not just integers.
             if len(val) > 0 and isinstance(val[0], int):
                 idx = rng.randrange(len(val))
-                val[idx] = val[idx] + rng.randint(-500, 500)
+                val[idx] = val[idx] + rng.randint(-MAX_INTEGER_RANGE, MAX_INTEGER_RANGE)
             else:
-                val.append(rng.randint(-1000, 1000))
+                # Mutate here any element for example remove elements or modify (aka remove and then add at the same index)
+                # val.append(rng.randint(-MAX_INTEGER_RANGE, MAX_INTEGER_RANGE))
 
         elif expected == "name":
             if pdf is not None:
@@ -481,8 +497,8 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
         elif expected == "bool":
             obj[key] = not bool(val)
 
-        elif expected == "string":
-            s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, 12)))
+        elif expected == "string": # Here generate very large strings too. Also try mutating the existing string maybe too?
+            s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, MAX_STRING_SIZE)))
             obj[key] = s
 
         elif expected == "dict" and isinstance(val, Dictionary) and depth < MAX_RECURSION:
@@ -492,7 +508,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
             mutate_stream_inplace(val, rng)
 
         else:
-            # fallback: reference an existing name instead of nonsense
+            # Here instead of just choosing a random name, please generate an entirely new datatype. of course this can be a name, but not necessarily...
             if pdf is not None:
                 obj[key] = rng.choice(collect_named_objects(pdf))
             else:
@@ -521,7 +537,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
 
     return True
 
-def mutate_stream_inplace(stream: Stream, rng: random.Random):
+def mutate_stream_inplace(stream: Stream, rng: random.Random): # Here instead of just removing and adding tiny portions, can you please modify this to also duplicate huge chunks probabilistically and also duplicate huge chunks too?
     """
     Mutate stream bytes in-place (read-modify-write) using rng.
     """

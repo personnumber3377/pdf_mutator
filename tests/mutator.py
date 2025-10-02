@@ -41,7 +41,9 @@ except Exception as e:
 # For debugging
 # -----------------------------
 
-DEBUG = False
+# DEBUG = False
+
+DEBUG = True
 
 def dprint(msg: str) -> None:
     if DEBUG:
@@ -308,7 +310,14 @@ def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
             for obj in pdf.objects:
                 try:
                     if isinstance(obj, (pikepdf.Dictionary, pikepdf.Array, pikepdf.Stream)):
-                        samples.append(pike_to_py(obj))
+                        the_thing = pike_to_py(obj)
+                        # Check if the thing is an empty result, if yes, then do not add it...
+                        if the_thing["__type__"] == "stream": # Check stream
+                            # dprint("the thing: "+str(the_thing))
+                            # dprint("length of the bullshit: "+str(len(the_thing["stream_bytes"])))
+                            if len(the_thing["stream_bytes"]) == 0: # Check empty stuff...
+                                continue # Continue if we have the shit...
+                        samples.append(the_thing)
                 except Exception:
                     continue
     except Exception as e:
