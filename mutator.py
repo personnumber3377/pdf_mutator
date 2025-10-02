@@ -498,6 +498,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
             obj[key] = not bool(val)
 
         elif expected == "string": # Here generate very large strings too. Also try mutating the existing string maybe too?
+            print("Mutated string...")
             s = "".join(chr(32 + (rng.randrange(95))) for _ in range(rng.randint(1, MAX_STRING_SIZE)))
             obj[key] = s
 
@@ -509,6 +510,7 @@ def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth: int = 0, pdf
 
         else:
             # Here instead of just choosing a random name, please generate an entirely new datatype. of course this can be a name, but not necessarily...
+            # You can also try guessing the type from the previous value...
             if pdf is not None:
                 obj[key] = rng.choice(collect_named_objects(pdf))
             else:
