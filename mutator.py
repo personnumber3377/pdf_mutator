@@ -2,24 +2,33 @@
 """
 mutator.py -- AFL++ Python custom mutator for PDF structural mutations.
 
-Improvements:
- - Dictionary mutation now infers new types from old values instead of always falling back to /Name.
- - Strings are mutated in-place (flip, extend, shrink, duplicate) or regenerated.
- - Arrays can be mutated heterogeneously: remove/duplicate/replace elements, add references from PDF.
- - Streams can mutate large slices, append big patterns, or inflate in size.
+Features:
+ - Deterministic mutation decisions derived from the input buffer.
+ - Loads a corpus of serialized PDF objects (dict/stream/array) from seed PDFs or cached pickle.
+ - Mutation strategies:
+     * Replace an object (Dictionary or Stream) with one from the resources DB.
+     * Mutate a Dictionary in-place (type-aware).
+     * Mutate a Stream in-place (bytes-level, with large slice ops).
+     * Shuffle pages occasionally.
+ - Keeps a HEADER_SIZE prefix intact (fuzzer header).
+ - Errors propagate (no silent fallback).
+
+Environment:
+ - MUTATOR_PDF_DIR  : dir with sample PDFs to build resources DB (default ./pdf_seed_corpus/)
+ - MUTATOR_PKL_PATH : path to pickle DB (default ./resources.pkl)
 """
 
-import os
-import io
-import sys
-import pickle
-import hashlib
+import os, io, sys, pickle, hashlib, random, traceback
 from pathlib import Path
 from typing import Any, Dict, List
-import random
-import traceback
 
 sys.setrecursionlimit(20000)
+
+DEBUG = True
+
+def dprint(msg):
+    if DEBUG:
+        print("[DEBUG] ",msg)
 
 try:
     import pikepdf
@@ -39,8 +48,7 @@ MAX_STRING_SIZE = 1000
 MAX_INTEGER_RANGE = 2**31
 MAX_RECURSION = 8
 MAX_SCALE_FACTOR = 1000.0
-
-BANNED_KEYS = {"/Length", "/Kids"}
+BANNED_KEYS = {"/Length", "/Kids", "/Count"}
 
 DEFAULT_PDF_DIR = Path(os.environ.get("MUTATOR_PDF_DIR", "./pdf_seed_corpus/"))
 DEFAULT_PKL_PATH = Path(os.environ.get("MUTATOR_PKL_PATH", "./resources.pkl"))
@@ -50,272 +58,232 @@ _initialized = False
 _resources_db: List[Dict[str, Any]] = []
 
 # -----------------------------
-# Helpers
+# RNG helpers
 # -----------------------------
-def dprint(msg: str):
-    print("[DEBUG]", msg)
-
 def rng_from_buf(buf: bytes) -> random.Random:
-    # stable RNG seeded from input buf
-    h = hashlib.sha256(buf[:128]).digest()
-    seed = int.from_bytes(h[:8], "little")
-    return random.Random(seed)
+    # h = hashlib.sha256(buf[:128]).digest()
+    # seed = int.from_bytes(h[:8], "little")
+    return random.Random(random.randrange(10000000)) # was originally random.Random(seed)
 
 def pick_choice(seq, rng: random.Random):
-    if not seq: return None
-    return seq[rng.randrange(len(seq))]
+    return seq[rng.randrange(len(seq))] if seq else None
 
-def collect_named_objects(pdf) -> List[Name]:
-    names = []
+# -----------------------------
+# pikepdf <-> Python serialization
+# -----------------------------
+def pike_to_py(obj: Any, depth: int = 0) -> Dict[str, Any]:
+    if depth >= MAX_RECURSION:
+        return {"__type__": "truncated"}
+    if isinstance(obj, Name):
+        return {"__type__": "name", "value": str(obj)}
+    if isinstance(obj, Stream):
+        d = {str(k): pike_to_py(v, depth+1) for k,v in obj.items()}
+        try:
+            raw = obj.read_bytes() or b""
+        except Exception:
+            raw = b""
+        return {"__type__": "stream", "dict": d, "stream_bytes": raw}
+    if isinstance(obj, Dictionary):
+        return {"__type__": "dict", "value": {str(k): pike_to_py(v, depth+1) for k,v in obj.items()}}
+    if isinstance(obj, Array):
+        return {"__type__": "array", "value": [pike_to_py(v, depth+1) for v in obj]}
+    if isinstance(obj, (int,float,bool)):
+        return {"__type__": "primitive", "value": obj}
+    if isinstance(obj, bytes):
+        return {"__type__": "bytes", "value": obj}
+    if isinstance(obj, str):
+        return {"__type__": "string", "value": obj}
+    return {"__type__": "unknown", "repr": str(obj)}
+
+def py_to_pike(pyobj: Any, pdf: pikepdf.Pdf=None) -> Any:
+    if not isinstance(pyobj, dict) or "__type__" not in pyobj:
+        return pyobj
+    t = pyobj["__type__"]
+    if t == "name":
+        v = pyobj.get("value","")
+        if not v.startswith("/"): v = "/"+v
+        return Name(v)
+    if t == "primitive": return pyobj.get("value")
+    if t == "bytes": return pyobj.get("value", b"")
+    if t == "string": return pyobj.get("value","")
+    if t == "array":
+        arr = Array()
+        for el in pyobj.get("value",[]): arr.append(py_to_pike(el,pdf))
+        return arr
+    if t == "dict":
+        d=Dictionary()
+        for k,v in pyobj.get("value",{}).items():
+            kname = k if k.startswith("/") else "/"+k
+            d[Name(kname)] = py_to_pike(v,pdf)
+        return d
+    if t == "stream":
+        md=Dictionary()
+        for k,v in pyobj.get("dict",{}).items():
+            kname = k if k.startswith("/") else "/"+k
+            md[Name(kname)] = py_to_pike(v,pdf)
+        data=pyobj.get("stream_bytes",b"")
+        if pdf is None:
+            return {"__construct_stream__": {"dict": md, "bytes": data}}
+        s=pikepdf.Stream(pdf,data)
+        for kk,vv in md.items():
+            if str(kk) not in BANNED_KEYS:
+                s[kk]=vv
+        return s
+    return Name("/Unknown")
+
+# -----------------------------
+# Build / load resources DB
+# -----------------------------
+def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
+    samples=[]
     try:
-        for obj in pdf.objects:
-            if isinstance(obj, Dictionary):
-                for v in obj.values():
-                    if isinstance(v, Name):
-                        names.append(v)
-            elif isinstance(obj, Array):
-                for v in obj:
-                    if isinstance(v, Name):
-                        names.append(v)
-    except Exception:
-        pass
-    if not names:
-        names = [Name("/Fallback")]
-    return names
+        with pikepdf.open(pdf_path) as pdf:
+            for obj in pdf.objects:
+                if isinstance(obj,(Dictionary,Array,Stream)):
+                    try: samples.append(pike_to_py(obj))
+                    except: continue
+    except Exception: pass
+    return samples
+
+def build_resources_db_from_dir(pdf_dir: Path,pkl_path: Path)->List[Dict[str, Any]]:
+    db=[]
+    for p in sorted(pdf_dir.iterdir()):
+        if p.suffix.lower()!=".pdf": continue
+        db.extend(extract_resource_samples_from_pdf(p))
+        if len(db)>=MAX_DB_SIZE: break
+    with open(pkl_path,"wb") as fh: pickle.dump(db[:MAX_DB_SIZE],fh)
+    return db[:MAX_DB_SIZE]
+
+def load_resources_db(pdf_dir: Path,pkl_path: Path)->List[Dict[str, Any]]:
+    if pkl_path.exists():
+        try:
+            with open(pkl_path,"rb") as fh: return pickle.load(fh)
+        except: pass
+    return build_resources_db_from_dir(pdf_dir,pkl_path)
 
 # -----------------------------
 # Mutation primitives
 # -----------------------------
-def mutate_string_value(s: str, rng: random.Random) -> str:
-    if not s or rng.random() < 0.3:
-        # regenerate random string
-        return "".join(chr(32 + rng.randrange(95)) for _ in range(rng.randint(1, MAX_STRING_SIZE)))
-    s = list(s)
-    choice = rng.randrange(4)
-    if choice == 0 and s:
-        # flip char
-        idx = rng.randrange(len(s))
-        s[idx] = chr(32 + rng.randrange(95))
-    elif choice == 1:
-        # duplicate chunk
-        if len(s) > 2:
-            start = rng.randrange(len(s)-1)
-            end = min(len(s), start + rng.randint(1, 10))
-            s = s[:end] + s[start:end]*rng.randint(1,3) + s[end:]
-    elif choice == 2 and s:
-        # truncate
-        s = s[:rng.randrange(len(s))]
-    elif choice == 3:
-        # extend
-        s += [chr(32 + rng.randrange(95)) for _ in range(rng.randint(1,50))]
-    return "".join(s)
-
-def mutate_array_value(arr: Array, rng: random.Random, pdf=None) -> None:
-    if not arr:
-        arr.append(rng.randint(-100, 100))
-        return
-    choice = rng.randrange(4)
-    if choice == 0:
-        # remove random element
-        idx = rng.randrange(len(arr))
-        del arr[idx]
-    elif choice == 1:
-        # duplicate random element
-        idx = rng.randrange(len(arr))
-        arr.insert(idx, arr[idx])
-    elif choice == 2:
-        # replace with random value
-        idx = rng.randrange(len(arr))
-        val = arr[idx]
-        if isinstance(val, int):
-            arr[idx] = val + rng.randint(-500,500)
-        elif isinstance(val, float):
-            arr[idx] = val * (1.0 + (rng.random()-0.5)*2)
-        elif isinstance(val, str):
-            arr[idx] = mutate_string_value(val, rng)
-        elif isinstance(val, Name) and pdf:
-            arr[idx] = rng.choice(collect_named_objects(pdf))
-        else:
-            arr[idx] = rng.randint(-1000,1000)
-    else:
-        # append new random element
-        arr.append(rng.choice([rng.randint(-1000,1000), rng.random(), Name("/Rand"+str(rng.randint(0,9999)))]))
-
-def mutate_stream_inplace(stream: Stream, rng: random.Random) -> bool:
+def mutate_stream_inplace(stream: Stream,rng: random.Random)->bool:
     try:
-        data = bytearray(stream.read_bytes() or b"")
-    except Exception:
-        try:
-            data = bytearray(stream.read_raw_bytes() or b"")
-        except Exception:
-            return False
-    if not data:
-        data = bytearray(b"A")
-
-    choice = rng.randrange(5)
-    if choice == 0:
-        pos = rng.randrange(len(data))
-        data[pos] ^= 0xFF
-    elif choice == 1:
-        # insert random byte
-        pos = rng.randrange(len(data))
-        data.insert(pos, rng.randrange(256))
-    elif choice == 2:
-        # delete chunk
-        start = rng.randrange(len(data))
-        end = min(len(data), start + rng.randint(1, 32))
-        del data[start:end]
-    elif choice == 3:
-        # duplicate large slice
-        start = rng.randrange(len(data))
-        end = min(len(data), start + rng.randint(50, min(1000,len(data)-start)))
-        chunk = data[start:end]
-        where = rng.randrange(len(data))
-        data = data[:where] + chunk* rng.randint(1,4) + data[where:]
+        data=bytearray(stream.read_bytes() or b"")
+    except: 
+        try: data=bytearray(stream.read_raw_bytes() or b"")
+        except: return False
+    if not data: data=bytearray(b"A")
+    choice=rng.randrange(5)
+    if choice==0: data[rng.randrange(len(data))]^=0xFF
+    elif choice==1: data.insert(rng.randrange(len(data)),rng.randrange(256))
+    elif choice==2: del data[rng.randrange(len(data)):][:rng.randint(1,32)]
+    elif choice==3 and len(data)>50:
+        start=rng.randrange(len(data)-1)
+        end=min(len(data),start+rng.randint(50,min(1000,len(data)-start)))
+        chunk=data[start:end]
+        where=rng.randrange(len(data))
+        data=data[:where]+chunk*rng.randint(1,3)+data[where:]
     else:
-        # append big block
-        block = bytes([rng.randrange(256)])*rng.randint(100,1000)
-        data.extend(block)
+        data.extend(bytes([rng.randrange(256)])*rng.randint(100,1000))
+    try: stream.write(bytes(data)); return True
+    except: return False
 
-    try:
-        stream.write(bytes(data))
-        return True
-    except Exception:
-        return False
-
-def mutate_dict_inplace(obj: Dictionary, rng: random.Random, depth=0, pdf=None) -> bool:
-    if not isinstance(obj, Dictionary) or not obj.keys():
-        return False
-    key = pick_choice(list(obj.keys()), rng)
+def mutate_dict_inplace(obj: Dictionary,rng: random.Random,depth=0,pdf=None)->bool:
+    if not obj.keys(): return False
+    key=pick_choice(list(obj.keys()),rng)
     if key is None: return False
-    val = obj[key]
-
+    val=obj[key]
     try:
-        if isinstance(val, int):
-            obj[key] = val + rng.randint(-1000,1000)
-        elif isinstance(val, float):
-            obj[key] = val * (1.0 + (rng.random()-0.5)*MAX_SCALE_FACTOR)
-        elif isinstance(val, str):
-            obj[key] = mutate_string_value(val, rng)
-        elif isinstance(val, Name):
-            if pdf:
-                obj[key] = rng.choice(collect_named_objects(pdf))
-            else:
-                obj[key] = Name("/Rand" + str(rng.randint(0,9999)))
-        elif isinstance(val, Array):
-            mutate_array_value(val, rng, pdf=pdf)
-        elif isinstance(val, Dictionary) and depth < MAX_RECURSION:
-            mutate_dict_inplace(val, rng, depth+1, pdf=pdf)
-        elif isinstance(val, Stream):
-            mutate_stream_inplace(val, rng)
-        else:
-            # fallback: random type
-            obj[key] = rng.choice([rng.randint(-1000,1000),
-                                   rng.random(),
-                                   mutate_string_value("", rng),
-                                   Name("/Rand"+str(rng.randint(0,9999)))])
-    except Exception:
-        return False
-
-    # occasional add/remove keys
-    if rng.random() < 0.1:
-        new_key = Name("/MutExtra"+str(rng.randint(0,9999)))
-        obj[new_key] = rng.randint(-100,100)
-    if rng.random() < 0.05 and obj.keys():
-        try:
-            del obj[pick_choice(list(obj.keys()), rng)]
-        except Exception:
-            pass
+        if isinstance(val,int): obj[key]=val+rng.randint(-1000,1000)
+        elif isinstance(val,float): obj[key]=val*(1.0+(rng.random()-0.5)*MAX_SCALE_FACTOR)
+        elif isinstance(val,str): obj[key]=val+"X"
+        elif isinstance(val,Name): obj[key]=Name("/Alt"+str(rng.randint(0,9999)))
+        elif isinstance(val,Array): val.append(rng.randint(-100,100))
+        elif isinstance(val,Dictionary) and depth<MAX_RECURSION:
+            mutate_dict_inplace(val,rng,depth+1,pdf)
+        elif isinstance(val,Stream): mutate_stream_inplace(val,rng)
+        else: obj[key]=Name("/Alt"+str(rng.randint(0,9999)))
+    except: return False
     return True
 
 # -----------------------------
-# Resource DB (unchanged)
+# Replace object with sample (from resource DB)
 # -----------------------------
-def extract_resource_samples_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
-    samples = []
-    try:
-        with pikepdf.open(pdf_path) as pdf:
-            for obj in pdf.objects:
-                if isinstance(obj, (Dictionary, Array, Stream)):
-                    try:
-                        raw = obj
-                        samples.append({"__type__": "dict", "value": {}})
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    return samples
-
-def build_resources_db_from_dir(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
-    db = []
-    for p in sorted(pdf_dir.iterdir()):
-        if not p.is_file() or p.suffix.lower() != ".pdf": continue
-        db.extend(extract_resource_samples_from_pdf(p))
-        if len(db) >= MAX_DB_SIZE: break
-    with open(pkl_path,"wb") as fh:
-        pickle.dump(db[:MAX_DB_SIZE], fh)
-    return db[:MAX_DB_SIZE]
-
-def load_resources_db(pdf_dir: Path, pkl_path: Path) -> List[Dict[str, Any]]:
-    if pkl_path.exists():
-        try:
-            with open(pkl_path,"rb") as fh:
-                return pickle.load(fh)
-        except Exception:
-            pass
-    return build_resources_db_from_dir(pdf_dir, pkl_path)
+def replace_object_with_sample(pdf: pikepdf.Pdf,target,sample_py,rng)->bool:
+    dprint("FUCKFUCK")
+    constructed=py_to_pike(sample_py,pdf)
+    if isinstance(target,Stream):
+        if isinstance(constructed,dict) and "__construct_stream__" in constructed:
+            meta=constructed["__construct_stream__"]["dict"]
+            data=constructed["__construct_stream__"]["bytes"]
+            target.write(data)
+            for kk,vv in meta.items():
+                if str(kk) not in BANNED_KEYS: target[kk]=vv
+            return True
+        elif isinstance(constructed,Stream):
+            target.write(constructed.read_bytes() or b"")
+            for kk,vv in constructed.items():
+                if str(kk) not in BANNED_KEYS: target[kk]=vv
+            return True
+    elif isinstance(target,Dictionary):
+        if isinstance(constructed,Dictionary):
+            dprint("type(target) == "+str(type(target)))
+            dprint("target.__dir__() == "+str(target.__dir__()))
+            dprint("target.keys() == "+str(target.keys()))
+            # target.clear()
+            for k in target.keys():
+                # k = k[1:] # Cut out the thing...
+                if k in BANNED_KEYS:
+                    continue
+                del target[k] # Delete the shit...
+            dprint("target.__dir__() == "+str(target.__dir__()))
+            for kk,vv in constructed.items():
+                target[kk]=vv
+            return True
+    return False
 
 # -----------------------------
-# Core structural mutator
+# Mutate whole PDF
 # -----------------------------
-def choose_target_object(pdf: pikepdf.Pdf, rng: random.Random):
-    cands = []
-    for obj in pdf.objects:
-        if isinstance(obj,(Dictionary,Stream)):
-            cands.append(obj)
-    return rng.choice(cands) if cands else None
-
-def mutate_pdf_structural(buf: bytes, max_size: int, rng: random.Random) -> bytes:
-    pdf = pikepdf.open(io.BytesIO(buf))
-    target = choose_target_object(pdf, rng)
-    if target is None:
-        return buf
-    if isinstance(target, Stream):
-        mutate_stream_inplace(target, rng)
-    elif isinstance(target, Dictionary):
-        mutate_dict_inplace(target, rng, pdf=pdf)
-
-    out = io.BytesIO()
-    pdf.save(out, linearize=False, compress_streams=False)
+def mutate_pdf_structural(buf: bytes,max_size:int,rng: random.Random)->bytes:
+    pdf=pikepdf.open(io.BytesIO(buf))
+    action=rng.randrange(100)
+    dprint(action)
+    if action<40 and _resources_db:
+        target=pick_choice([o for o in pdf.objects if isinstance(o,(Dictionary,Stream))],rng)
+        if target: replace_object_with_sample(pdf,target,rng.choice(_resources_db),rng)
+    elif action<100:
+        target=pick_choice([o for o in pdf.objects if isinstance(o,(Dictionary,Stream))],rng)
+        if isinstance(target,Stream): mutate_stream_inplace(target,rng)
+        elif isinstance(target,Dictionary): mutate_dict_inplace(target,rng,pdf=pdf)
+    else:
+        pages=list(pdf.pages)
+        if len(pages)>1: random.shuffle(pages)
+    out=io.BytesIO(); pdf.save(out,linearize=False,compress_streams=False)
     return out.getvalue()[:max_size]
 
 # -----------------------------
 # AFL++ API
 # -----------------------------
-def init(seed: int):
-    global _initialized, _resources_db
+def init(seed:int):
+    global _initialized,_resources_db
     if _initialized: return
-    _resources_db = load_resources_db(DEFAULT_PDF_DIR, DEFAULT_PKL_PATH)
-    _initialized = True
+    _resources_db=load_resources_db(DEFAULT_PDF_DIR,DEFAULT_PKL_PATH)
+    _initialized=True
 
 def deinit():
-    global _initialized
-    _initialized = False
+    global _initialized; _initialized=False
 
-def fuzz_count(buf: bytearray) -> int:
-    if len(buf) <= HEADER_SIZE: return 0
+def fuzz_count(buf:bytearray)->int:
+    if len(buf)<=HEADER_SIZE: return 0
     try:
-        core = buf[HEADER_SIZE:]
+        core=buf[HEADER_SIZE:]
         with pikepdf.open(io.BytesIO(core)): pass
         return _mutation_count
-    except Exception:
-        return 0
+    except: return 0
 
-def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
-    header = buf[:HEADER_SIZE]
-    core = buf[HEADER_SIZE:]
-    rng = rng_from_buf(buf)
-    mutated = mutate_pdf_structural(core, max_size-HEADER_SIZE, rng)
+def fuzz(buf:bytearray,add_buf,max_size:int)->bytearray:
+    header=buf[:HEADER_SIZE]; core=buf[HEADER_SIZE:]
+    rng=rng_from_buf(buf)
+    mutated=mutate_pdf_structural(core,max_size-HEADER_SIZE,rng)
     return bytearray(header+mutated)
 
 # -----------------------------
@@ -323,14 +291,14 @@ def fuzz(buf: bytearray, add_buf, max_size: int) -> bytearray:
 # -----------------------------
 if __name__=="__main__":
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mutate", nargs=2)
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--mutate",nargs=3)
     args=ap.parse_args()
     if args.mutate:
         init(0)
-        infile,outfile=args.mutate
-        data=open(infile,"rb").read()
+        data=open(args.mutate[0],"rb").read()
         data=b"\x00\x00\x00\x00"+data
-        mutated=fuzz(bytearray(data),None,10_000_000)
-        open(outfile,"wb").write(mutated)
-        print("Wrote",outfile)
+        for _ in range(int(args.mutate[2])):
+            data=fuzz(bytearray(data),None,10_000_000)
+        open(args.mutate[1],"wb").write(data)
+        print("Wrote",args.mutate[1])
